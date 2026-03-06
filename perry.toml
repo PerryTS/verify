@@ -1,0 +1,8 @@
+[project]
+name = "perry-verify"
+entry = "src/main.ts"
+version = "0.1.0"
+
+[build]
+out_dir = "dist"
+opt_level = 2
