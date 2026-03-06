@@ -1,83 +1,183 @@
 // Audit rules — all security rule functions
+// Uses ONLY indexOf() for pattern matching (Perry doesn't support new RegExp())
 
 import {
   AuditFinding, AuditSeverity, AuditConfig, SourceFile,
 } from './types';
 import {
-  SECRET_PATTERNS, SECRET_VAR_NAMES, PLACEHOLDER_VALUES,
-  UNSAFE_EXEC_PATTERNS, SQL_QUERY_METHODS,
-  SENSITIVE_ROUTES, WEAK_HASH_PATTERNS, MATH_RANDOM_SECRET,
   shannonEntropy, isCommentLine, isPlaceholder, isProcessEnvRef,
-  getLineNumber, getLineAt, truncateSnippet,
+  getLineAt, truncateSnippet,
 } from './patterns';
 
 // --- Tier 1: Critical ---
 
+// Secret prefix patterns: [prefix, description]
+const SECRET_PREFIXES: string[][] = [
+  ['sk_live_', 'Stripe secret key'],
+  ['sk_test_', 'Stripe test key'],
+  ['pk_live_', 'Stripe publishable key'],
+  ['AKIA', 'AWS access key'],
+  ['ghp_', 'GitHub personal access token'],
+  ['gho_', 'GitHub OAuth token'],
+  ['ghs_', 'GitHub app token'],
+  ['github_pat_', 'GitHub fine-grained token'],
+  ['glpat-', 'GitLab personal access token'],
+  ['xoxb-', 'Slack bot token'],
+  ['xoxp-', 'Slack user token'],
+  ['xapp-', 'Slack app token'],
+  ['-----BEGIN PRIVATE KEY-----', 'Private key'],
+  ['-----BEGIN RSA PRIVATE KEY-----', 'RSA private key'],
+  ['-----BEGIN EC PRIVATE KEY-----', 'EC private key'],
+  ['-----BEGIN OPENSSH PRIVATE KEY-----', 'OpenSSH private key'],
+];
+
+// DB connection string patterns
+const DB_PREFIXES: string[] = [
+  'mysql://', 'postgres://', 'postgresql://', 'mongodb://', 'redis://',
+];
+
+// Secret variable name fragments
+const SECRET_VAR_FRAGMENTS: string[] = [
+  'api_key', 'apikey', 'api_secret', 'apisecret',
+  'secret_key', 'secretkey', 'private_key', 'privatekey',
+  'access_token', 'accesstoken', 'auth_token', 'authtoken',
+  'client_secret', 'clientsecret', 'password', 'passwd',
+  'db_password', 'database_password', 'connection_string',
+  'encryption_key', 'signing_key', 'master_key',
+];
+
+// Placeholder values to skip
+const SKIP_VALUES: string[] = [
+  'your-key-here', 'your_key_here', 'your-api-key',
+  'replace_me', 'todo', 'xxx', 'changeme', 'placeholder',
+  'example', 'test', 'dummy', 'fake', 'sample',
+  'insert-key-here', 'your-secret-here',
+];
+
+function isSkipValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  for (let i = 0; i < SKIP_VALUES.length; i++) {
+    if (lower.indexOf(SKIP_VALUES[i]) >= 0) return true;
+  }
+  return false;
+}
+
+// Extract string value from assignment line: const x = 'value' or "value"
+function extractAssignedString(line: string): string {
+  // Find = followed by quote
+  const eqIdx = line.indexOf('=');
+  if (eqIdx < 0) return '';
+  const afterEq = line.substring(eqIdx + 1).trim();
+  if (afterEq.length < 3) return '';
+  const quote = afterEq.charAt(0);
+  if (quote !== '\'' && quote !== '"') return '';
+  const endQuote = afterEq.indexOf(quote, 1);
+  if (endQuote < 0) return '';
+  return afterEq.substring(1, endQuote);
+}
+
 export function checkHardcodedSecrets(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // Check known secret patterns
-  for (let pi = 0; pi < SECRET_PATTERNS.length; pi++) {
-    const pattern = SECRET_PATTERNS[pi][0];
-    const desc = SECRET_PATTERNS[pi][1];
-    const regex = new RegExp(pattern, 'g');
-    let match = regex.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-      if (!isCommentLine(lineText) && !isPlaceholder(match[0])) {
+    if (isCommentLine(line)) continue;
+
+    // Check secret prefixes
+    for (let pi = 0; pi < SECRET_PREFIXES.length; pi++) {
+      const prefix = SECRET_PREFIXES[pi][0];
+      const desc = SECRET_PREFIXES[pi][1];
+
+      if (line.indexOf(prefix) >= 0) {
         findings[findCount] = {
           id: 'hardcoded-secret',
           severity: 'critical' as AuditSeverity,
           title: 'Hardcoded ' + desc,
           file: file.path,
           line: lineNum,
-          snippet: truncateSnippet(lineText, 120),
+          snippet: truncateSnippet(line, 120),
           what: 'A ' + desc + ' is embedded in your source code.',
           risk: 'Anyone who sees your code can use this credential.',
           fix: 'Use an environment variable instead.',
           fixCode: 'process.env.YOUR_SECRET_NAME',
         };
         findCount++;
+        break; // one finding per line for prefixes
       }
-      match = regex.exec(content);
     }
-  }
 
-  // Check variable assignments with secret-like names + high-entropy values
-  for (let vi = 0; vi < SECRET_VAR_NAMES.length; vi++) {
-    const varName = SECRET_VAR_NAMES[vi];
-    // Match: const/let/var secretName = 'value' or "value"
-    const pat = new RegExp('(?:const|let|var)\\s+\\w*' + varName + '\\w*\\s*=\\s*["\']([^"\']{8,})["\']', 'gi');
-    let match = pat.exec(content);
-    while (match !== null) {
-      const value = match[1];
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
-
-      if (!isCommentLine(lineText) && !isPlaceholder(value) && !isProcessEnvRef(lineText)) {
-        const entropy = shannonEntropy(value);
-        if (entropy > 4.0) {
-          findings[findCount] = {
-            id: 'hardcoded-secret',
-            severity: 'critical' as AuditSeverity,
-            title: 'Hardcoded secret in variable',
-            file: file.path,
-            line: lineNum,
-            snippet: truncateSnippet(lineText, 120),
-            what: 'A high-entropy string is assigned to a secret-named variable.',
-            risk: 'This looks like a real credential embedded in source code.',
-            fix: 'Use an environment variable: process.env.' + varName.toUpperCase(),
-            fixCode: 'const ' + varName + ' = process.env.' + varName.toUpperCase() + ' || \'\'',
-          };
-          findCount++;
+    // Check DB connection strings with passwords (contains :// and @ with password)
+    for (let di = 0; di < DB_PREFIXES.length; di++) {
+      const dbPfx = DB_PREFIXES[di];
+      const dbIdx = line.indexOf(dbPfx);
+      if (dbIdx >= 0) {
+        const afterProto = line.substring(dbIdx + dbPfx.length);
+        // Look for user:pass@host pattern
+        if (afterProto.indexOf(':') >= 0 && afterProto.indexOf('@') >= 0) {
+          const colonIdx = afterProto.indexOf(':');
+          const atIdx = afterProto.indexOf('@');
+          if (colonIdx < atIdx) {
+            // There's a password between : and @
+            findings[findCount] = {
+              id: 'hardcoded-secret',
+              severity: 'critical' as AuditSeverity,
+              title: 'Database connection string with password',
+              file: file.path,
+              line: lineNum,
+              snippet: truncateSnippet(line, 120),
+              what: 'A database connection string with embedded password found.',
+              risk: 'Anyone who sees your code can access your database.',
+              fix: 'Use environment variables for database credentials.',
+              fixCode: 'process.env.DATABASE_URL',
+            };
+            findCount++;
+            break;
+          }
         }
       }
-      match = pat.exec(content);
+    }
+
+    // Check secret-named variable assignments with high-entropy values
+    if (isProcessEnvRef(line)) continue;
+    if (line.indexOf('=') < 0) continue;
+
+    const lineLower = line.toLowerCase();
+    for (let vi = 0; vi < SECRET_VAR_FRAGMENTS.length; vi++) {
+      const varFrag = SECRET_VAR_FRAGMENTS[vi];
+      // Check if the variable name part (before =) contains the fragment
+      const eqIdx = line.indexOf('=');
+      if (eqIdx < 0) continue;
+      const beforeEq = lineLower.substring(0, eqIdx);
+      if (beforeEq.indexOf(varFrag) < 0) continue;
+
+      // Must be an assignment (const/let/var)
+      if (lineLower.indexOf('const ') < 0 && lineLower.indexOf('let ') < 0 && lineLower.indexOf('var ') < 0) continue;
+
+      const value = extractAssignedString(line);
+      if (value.length < 8) continue;
+      if (isSkipValue(value)) continue;
+
+      const entropy = shannonEntropy(value);
+      if (entropy > 4.0) {
+        findings[findCount] = {
+          id: 'hardcoded-secret',
+          severity: 'critical' as AuditSeverity,
+          title: 'Hardcoded secret in variable',
+          file: file.path,
+          line: lineNum,
+          snippet: truncateSnippet(line, 120),
+          what: 'A high-entropy string assigned to a secret-named variable.',
+          risk: 'This looks like a real credential embedded in source code.',
+          fix: 'Use an environment variable instead.',
+          fixCode: 'process.env.' + varFrag.toUpperCase(),
+        };
+        findCount++;
+        break; // one finding per line
+      }
     }
   }
 
@@ -87,148 +187,133 @@ export function checkHardcodedSecrets(file: SourceFile): AuditFinding[] {
 export function checkUnsafeExecution(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // Check eval, new Function, etc.
-  for (let pi = 0; pi < UNSAFE_EXEC_PATTERNS.length; pi++) {
-    const pattern = UNSAFE_EXEC_PATTERNS[pi];
-    const regex = new RegExp(pattern, 'g');
-    let match = regex.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
+    const trimmed = line.trim();
 
-      if (!isCommentLine(lineText)) {
-        findings[findCount] = {
-          id: 'unsafe-exec',
-          severity: 'critical' as AuditSeverity,
-          title: 'Unsafe code execution',
-          file: file.path,
-          line: lineNum,
-          snippet: truncateSnippet(lineText, 120),
-          what: 'Dynamic code execution detected.',
-          risk: 'If user input reaches this, attackers can run arbitrary code.',
-          fix: 'Avoid eval/new Function. Use safer alternatives like JSON.parse for data.',
-          fixCode: '',
-        };
-        findCount++;
-      }
-      match = regex.exec(content);
+    if (isCommentLine(line)) continue;
+
+    // eval()
+    if (line.indexOf('eval(') >= 0 || line.indexOf('eval (') >= 0) {
+      findings[findCount] = {
+        id: 'unsafe-exec',
+        severity: 'critical' as AuditSeverity,
+        title: 'Unsafe eval() call',
+        file: file.path,
+        line: lineNum,
+        snippet: truncateSnippet(line, 120),
+        what: 'eval() executes arbitrary code.',
+        risk: 'If user input reaches eval, attackers can run arbitrary code.',
+        fix: 'Avoid eval. Use JSON.parse for data, or safer alternatives.',
+        fixCode: '',
+      };
+      findCount++;
     }
-  }
 
-  // Check execSync/exec with string interpolation from potential user input
-  const execInterp = new RegExp('(?:execSync|exec|spawnSync)\\s*\\(\\s*`[^`]*\\$\\{', 'g');
-  let execMatch = execInterp.exec(content);
-  while (execMatch !== null) {
-    const lineNum = getLineNumber(content, execMatch.index);
-    const lineText = getLineAt(lines, lineNum);
+    // new Function()
+    if (line.indexOf('new Function(') >= 0 || line.indexOf('new Function (') >= 0) {
+      findings[findCount] = {
+        id: 'unsafe-exec',
+        severity: 'critical' as AuditSeverity,
+        title: 'Unsafe new Function() call',
+        file: file.path,
+        line: lineNum,
+        snippet: truncateSnippet(line, 120),
+        what: 'new Function() creates code from strings.',
+        risk: 'If user input reaches this, attackers can run arbitrary code.',
+        fix: 'Avoid new Function. Use safer alternatives.',
+        fixCode: '',
+      };
+      findCount++;
+    }
 
-    if (!isCommentLine(lineText)) {
+    // execSync/exec with template literal interpolation
+    if ((line.indexOf('execSync') >= 0 || line.indexOf('exec(') >= 0 || line.indexOf('spawnSync') >= 0) &&
+        line.indexOf('`') >= 0 && line.indexOf('${') >= 0) {
       findings[findCount] = {
         id: 'unsafe-exec',
         severity: 'critical' as AuditSeverity,
         title: 'Command injection risk',
         file: file.path,
         line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
+        snippet: truncateSnippet(line, 120),
         what: 'Shell command built with string interpolation.',
         risk: 'If user input is interpolated, attackers can inject shell commands.',
-        fix: 'Use spawnSync with an args array instead of shell string interpolation.',
+        fix: 'Use spawnSync with an args array instead.',
         fixCode: 'child_process.spawnSync(cmd, [arg1, arg2])',
       };
       findCount++;
     }
-    execMatch = execInterp.exec(content);
-  }
-
-  // Check dynamic require/import
-  const dynReq = new RegExp('(?:require|import)\\s*\\(\\s*(?![\'"]).', 'g');
-  let dynMatch = dynReq.exec(content);
-  while (dynMatch !== null) {
-    const lineNum = getLineNumber(content, dynMatch.index);
-    const lineText = getLineAt(lines, lineNum);
-
-    if (!isCommentLine(lineText)) {
-      findings[findCount] = {
-        id: 'unsafe-exec',
-        severity: 'critical' as AuditSeverity,
-        title: 'Dynamic module loading',
-        file: file.path,
-        line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
-        what: 'Module loaded with a dynamic (non-literal) path.',
-        risk: 'If user input controls the path, attackers can load arbitrary modules.',
-        fix: 'Use static import paths.',
-        fixCode: '',
-      };
-      findCount++;
-    }
-    dynMatch = dynReq.exec(content);
   }
 
   return findings;
 }
 
+function hasSqlKeyword(line: string): boolean {
+  const upper = line.toUpperCase();
+  if (upper.indexOf('SELECT') >= 0) return true;
+  if (upper.indexOf('INSERT') >= 0) return true;
+  if (upper.indexOf('UPDATE') >= 0) return true;
+  if (upper.indexOf('DELETE FROM') >= 0) return true;
+  if (upper.indexOf('DROP') >= 0) return true;
+  if (upper.indexOf('ALTER') >= 0) return true;
+  if (upper.indexOf('WHERE') >= 0) return true;
+  return false;
+}
+
 export function checkSqlInjection(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // Check .query/.execute with template literals
-  for (let mi = 0; mi < SQL_QUERY_METHODS.length; mi++) {
-    const method = SQL_QUERY_METHODS[mi];
-    // Template literal: .query(`...${...}...`)
-    const tplPat = new RegExp('\\' + method + '\\s*\\(\\s*`[^`]*\\$\\{', 'g');
-    let match = tplPat.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-      if (!isCommentLine(lineText)) {
-        findings[findCount] = {
-          id: 'sql-injection',
-          severity: 'critical' as AuditSeverity,
-          title: 'SQL injection risk',
-          file: file.path,
-          line: lineNum,
-          snippet: truncateSnippet(lineText, 120),
-          what: 'SQL query built with template literal interpolation.',
-          risk: 'User input in the query can modify SQL logic, exposing or deleting data.',
-          fix: 'Use parameterized queries with placeholders.',
-          fixCode: 'db.query(\'SELECT * FROM users WHERE id = $1\', [userId])',
-        };
-        findCount++;
-      }
-      match = tplPat.exec(content);
+    if (isCommentLine(line)) continue;
+
+    // Must have a SQL query method
+    let methodIdx = -1;
+    let methodLen = 0;
+
+    if (line.indexOf('.query(') >= 0) {
+      methodIdx = line.indexOf('.query(');
+      methodLen = 7;
+    } else if (line.indexOf('.execute(') >= 0) {
+      methodIdx = line.indexOf('.execute(');
+      methodLen = 9;
     }
 
-    // String concatenation: .query('...' + variable)
-    const concatPat = new RegExp('\\' + method + '\\s*\\(\\s*["\'][^"\']*["\']\\s*\\+', 'g');
-    let concatMatch = concatPat.exec(content);
-    while (concatMatch !== null) {
-      const lineNum = getLineNumber(content, concatMatch.index);
-      const lineText = getLineAt(lines, lineNum);
+    if (methodIdx < 0) continue;
 
-      if (!isCommentLine(lineText)) {
-        findings[findCount] = {
-          id: 'sql-injection',
-          severity: 'critical' as AuditSeverity,
-          title: 'SQL injection risk',
-          file: file.path,
-          line: lineNum,
-          snippet: truncateSnippet(lineText, 120),
-          what: 'SQL query built with string concatenation.',
-          risk: 'User input concatenated into SQL can modify query logic.',
-          fix: 'Use parameterized queries with placeholders.',
-          fixCode: 'db.query(\'SELECT * FROM users WHERE id = $1\', [userId])',
-        };
-        findCount++;
-      }
-      concatMatch = concatPat.exec(content);
-    }
+    const afterMethod = line.substring(methodIdx + methodLen);
+
+    // Must have string concatenation or interpolation
+    let hasConcat = false;
+    if (afterMethod.indexOf('`') >= 0 && afterMethod.indexOf('${') >= 0) hasConcat = true;
+    if (afterMethod.indexOf('+') >= 0) hasConcat = true;
+
+    if (!hasConcat) continue;
+
+    // Must have SQL keywords somewhere on the line
+    if (!hasSqlKeyword(line)) continue;
+
+    findings[findCount] = {
+      id: 'sql-injection',
+      severity: 'critical' as AuditSeverity,
+      title: 'SQL injection risk',
+      file: file.path,
+      line: lineNum,
+      snippet: truncateSnippet(line, 120),
+      what: 'SQL query built with string concatenation or interpolation.',
+      risk: 'User input in the query can modify SQL logic, exposing or deleting data.',
+      fix: 'Use parameterized queries with placeholders.',
+      fixCode: 'db.query(\'SELECT * FROM users WHERE id = $1\', [userId])',
+    };
+    findCount++;
   }
 
   return findings;
@@ -236,56 +321,72 @@ export function checkSqlInjection(file: SourceFile): AuditFinding[] {
 
 // --- Tier 2: High (server apps) ---
 
+function isSensitiveRoute(line: string): string {
+  // Return the matched route name, or empty string if none
+  if (line.indexOf('/admin') >= 0) return '/admin';
+  if (line.indexOf('/delete') >= 0) return '/delete';
+  if (line.indexOf('/internal') >= 0) return '/internal';
+  if (line.indexOf('/debug') >= 0) return '/debug';
+  if (line.indexOf('/management') >= 0) return '/management';
+  if (line.indexOf('/dashboard') >= 0) return '/dashboard';
+  if (line.indexOf('/config') >= 0) return '/config';
+  if (line.indexOf('/settings') >= 0) return '/settings';
+  return '';
+}
+
+function isRouteDef(line: string): boolean {
+  if (line.indexOf('.get(') >= 0) return true;
+  if (line.indexOf('.post(') >= 0) return true;
+  if (line.indexOf('.put(') >= 0) return true;
+  if (line.indexOf('.delete(') >= 0) return true;
+  if (line.indexOf('.patch(') >= 0) return true;
+  return false;
+}
+
 export function checkUnprotectedRoutes(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  for (let ri = 0; ri < SENSITIVE_ROUTES.length; ri++) {
-    const route = SENSITIVE_ROUTES[ri];
-    // Match: .get('/admin' or .post('/admin' etc.
-    const pat = new RegExp('\\.(get|post|put|delete|patch)\\s*\\(\\s*["\']' + escapeRegex(route) + '["\'/]', 'g');
-    let match = pat.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-      if (!isCommentLine(lineText)) {
-        // Check if there's auth middleware nearby (within 5 lines above or in same line)
-        let hasAuth = false;
-        const startLine = lineNum > 5 ? lineNum - 5 : 1;
-        for (let li = startLine; li <= lineNum; li++) {
-          const checkLine = getLineAt(lines, li);
-          if (checkLine.indexOf('preHandler') >= 0 ||
-              checkLine.indexOf('auth') >= 0 ||
-              checkLine.indexOf('authenticate') >= 0 ||
-              checkLine.indexOf('middleware') >= 0 ||
-              checkLine.indexOf('requireAuth') >= 0 ||
-              checkLine.indexOf('isAdmin') >= 0 ||
-              checkLine.indexOf('verifyToken') >= 0) {
-            hasAuth = true;
-            break;
-          }
-        }
+    if (isCommentLine(line)) continue;
+    if (!isRouteDef(line)) continue;
 
-        if (!hasAuth) {
-          findings[findCount] = {
-            id: 'unprotected-routes',
-            severity: 'high' as AuditSeverity,
-            title: 'Unprotected sensitive route: ' + route,
-            file: file.path,
-            line: lineNum,
-            snippet: truncateSnippet(lineText, 120),
-            what: 'The route ' + route + ' appears to lack authentication.',
-            risk: 'Unauthenticated users may access admin or sensitive functionality.',
-            fix: 'Add authentication middleware (preHandler) to this route.',
-            fixCode: '{ preHandler: [authenticateUser] }',
-          };
-          findCount++;
-        }
+    const route = isSensitiveRoute(line);
+    if (route.length === 0) continue;
+
+    // Check if there's auth middleware nearby (within 5 lines above or same line)
+    let hasAuth = false;
+    const startLine = lineNum > 5 ? lineNum - 5 : 1;
+    for (let li = startLine; li <= lineNum; li++) {
+      const checkLine = getLineAt(lines, li);
+      if (checkLine.indexOf('preHandler') >= 0 ||
+          checkLine.indexOf('authenticate') >= 0 ||
+          checkLine.indexOf('requireAuth') >= 0 ||
+          checkLine.indexOf('isAdmin') >= 0 ||
+          checkLine.indexOf('verifyToken') >= 0) {
+        hasAuth = true;
+        break;
       }
-      match = pat.exec(content);
+    }
+
+    if (!hasAuth) {
+      findings[findCount] = {
+        id: 'unprotected-routes',
+        severity: 'high' as AuditSeverity,
+        title: 'Unprotected sensitive route: ' + route,
+        file: file.path,
+        line: lineNum,
+        snippet: truncateSnippet(line, 120),
+        what: 'The route ' + route + ' appears to lack authentication.',
+        risk: 'Unauthenticated users may access admin or sensitive functionality.',
+        fix: 'Add authentication middleware (preHandler) to this route.',
+        fixCode: '{ preHandler: [authenticateUser] }',
+      };
+      findCount++;
     }
   }
 
@@ -295,49 +396,23 @@ export function checkUnprotectedRoutes(file: SourceFile): AuditFinding[] {
 export function checkMissingSecurityHeaders(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // Check CORS wildcard
-  const corsStar = new RegExp('cors\\s*\\(\\s*\\{[^}]*origin\\s*:\\s*["\']\\*["\']', 'g');
-  let corsMatch = corsStar.exec(content);
-  while (corsMatch !== null) {
-    const lineNum = getLineNumber(content, corsMatch.index);
-    const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-    if (!isCommentLine(lineText)) {
+    if (isCommentLine(line)) continue;
+
+    // CORS wildcard
+    if (line.indexOf('Access-Control-Allow-Origin') >= 0 && line.indexOf('*') >= 0) {
       findings[findCount] = {
         id: 'missing-security',
         severity: 'high' as AuditSeverity,
         title: 'CORS allows all origins',
         file: file.path,
         line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
-        what: 'CORS is configured to allow requests from any origin.',
-        risk: 'Any website can make authenticated requests to your API.',
-        fix: 'Restrict CORS to specific trusted origins.',
-        fixCode: 'origin: [\'https://yourdomain.com\']',
-      };
-      findCount++;
-    }
-    corsMatch = corsStar.exec(content);
-  }
-
-  // Also check Access-Control-Allow-Origin: *
-  const acoStar = new RegExp('Access-Control-Allow-Origin["\']\\s*,\\s*["\']\\*["\']', 'g');
-  let acoMatch = acoStar.exec(content);
-  while (acoMatch !== null) {
-    const lineNum = getLineNumber(content, acoMatch.index);
-    const lineText = getLineAt(lines, lineNum);
-
-    if (!isCommentLine(lineText)) {
-      findings[findCount] = {
-        id: 'missing-security',
-        severity: 'high' as AuditSeverity,
-        title: 'CORS allows all origins',
-        file: file.path,
-        line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
+        snippet: truncateSnippet(line, 120),
         what: 'Access-Control-Allow-Origin is set to wildcard.',
         risk: 'Any website can make requests to your API.',
         fix: 'Restrict to specific trusted origins.',
@@ -345,7 +420,23 @@ export function checkMissingSecurityHeaders(file: SourceFile): AuditFinding[] {
       };
       findCount++;
     }
-    acoMatch = acoStar.exec(content);
+
+    // origin: '*' in CORS config
+    if (line.indexOf('origin') >= 0 && line.indexOf("'*'") >= 0) {
+      findings[findCount] = {
+        id: 'missing-security',
+        severity: 'high' as AuditSeverity,
+        title: 'CORS allows all origins',
+        file: file.path,
+        line: lineNum,
+        snippet: truncateSnippet(line, 120),
+        what: 'CORS origin set to wildcard.',
+        risk: 'Any website can make authenticated requests to your API.',
+        fix: 'Restrict CORS to specific trusted origins.',
+        fixCode: 'origin: [\'https://yourdomain.com\']',
+      };
+      findCount++;
+    }
   }
 
   return findings;
@@ -354,80 +445,65 @@ export function checkMissingSecurityHeaders(file: SourceFile): AuditFinding[] {
 export function checkInsecureCrypto(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // Weak hash functions
-  for (let wi = 0; wi < WEAK_HASH_PATTERNS.length; wi++) {
-    const pattern = WEAK_HASH_PATTERNS[wi];
-    const regex = new RegExp(pattern, 'g');
-    let match = regex.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-      if (!isCommentLine(lineText)) {
-        // Check if used for password hashing (look for 'password' nearby)
-        let isPasswordRelated = false;
-        const startLine = lineNum > 3 ? lineNum - 3 : 1;
-        const endLine = lineNum + 3 < lines.length ? lineNum + 3 : lines.length;
-        for (let li = startLine; li <= endLine; li++) {
-          const checkLine = getLineAt(lines, li).toLowerCase();
-          if (checkLine.indexOf('password') >= 0 || checkLine.indexOf('passwd') >= 0) {
-            isPasswordRelated = true;
-            break;
-          }
+    if (isCommentLine(line)) continue;
+
+    // Weak hash: createHash('md5') or createHash("md5")
+    if (line.indexOf('createHash') >= 0 &&
+        (line.indexOf("'md5'") >= 0 || line.indexOf('"md5"') >= 0 ||
+         line.indexOf("'sha1'") >= 0 || line.indexOf('"sha1"') >= 0)) {
+      // Check if related to password
+      let isPasswordRelated = false;
+      const startLine = lineNum > 3 ? lineNum - 3 : 1;
+      const endLine = lineNum + 3 < lines.length ? lineNum + 3 : lines.length;
+      for (let li = startLine; li <= endLine; li++) {
+        const checkLine = getLineAt(lines, li).toLowerCase();
+        if (checkLine.indexOf('password') >= 0 || checkLine.indexOf('passwd') >= 0) {
+          isPasswordRelated = true;
+          break;
         }
+      }
 
+      findings[findCount] = {
+        id: 'insecure-crypto',
+        severity: 'high' as AuditSeverity,
+        title: isPasswordRelated ? 'Weak hash for passwords' : 'Weak hash algorithm',
+        file: file.path,
+        line: lineNum,
+        snippet: truncateSnippet(line, 120),
+        what: isPasswordRelated ? 'MD5/SHA1 used for password hashing.' : 'MD5/SHA1 hash detected.',
+        risk: isPasswordRelated ? 'These are broken for passwords. Attackers can crack them easily.' : 'MD5/SHA1 are cryptographically weak.',
+        fix: isPasswordRelated ? 'Use bcrypt or argon2 for password hashing.' : 'Use SHA-256 or SHA-512.',
+        fixCode: isPasswordRelated ? 'bcrypt.hash(password, 10)' : 'crypto.createHash(\'sha256\')',
+      };
+      findCount++;
+    }
+
+    // Math.random for security-sensitive context
+    if (line.indexOf('Math.random') >= 0) {
+      const lower = line.toLowerCase();
+      if (lower.indexOf('token') >= 0 || lower.indexOf('secret') >= 0 ||
+          lower.indexOf('session') >= 0 || lower.indexOf('nonce') >= 0 ||
+          lower.indexOf('salt') >= 0) {
         findings[findCount] = {
           id: 'insecure-crypto',
           severity: 'high' as AuditSeverity,
-          title: isPasswordRelated ? 'Weak hash for passwords' : 'Weak hash algorithm',
+          title: 'Math.random() used for security',
           file: file.path,
           line: lineNum,
-          snippet: truncateSnippet(lineText, 120),
-          what: isPasswordRelated ? 'MD5/SHA1 used for password hashing.' : 'MD5/SHA1 hash detected.',
-          risk: isPasswordRelated ? 'MD5/SHA1 are broken for passwords. Attackers can crack them easily.' : 'MD5/SHA1 are cryptographically weak.',
-          fix: isPasswordRelated ? 'Use bcrypt or argon2 for password hashing.' : 'Use SHA-256 or SHA-512.',
-          fixCode: isPasswordRelated ? 'import bcrypt from \'bcrypt\'; bcrypt.hash(password, 10)' : 'crypto.createHash(\'sha256\')',
+          snippet: truncateSnippet(line, 120),
+          what: 'Math.random() is not cryptographically secure.',
+          risk: 'Tokens generated with Math.random() are predictable.',
+          fix: 'Use crypto.randomUUID() or crypto.randomBytes().',
+          fixCode: 'crypto.randomUUID()',
         };
         findCount++;
       }
-      match = regex.exec(content);
-    }
-  }
-
-  // Math.random for secrets/tokens
-  for (let mi = 0; mi < MATH_RANDOM_SECRET.length; mi++) {
-    const pattern = MATH_RANDOM_SECRET[mi];
-    const regex = new RegExp(pattern, 'g');
-    let match = regex.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
-      const lower = lineText.toLowerCase();
-
-      if (!isCommentLine(lineText)) {
-        // Only flag if used for token/secret/id generation
-        if (lower.indexOf('token') >= 0 || lower.indexOf('secret') >= 0 ||
-            lower.indexOf('key') >= 0 || lower.indexOf('session') >= 0 ||
-            lower.indexOf('nonce') >= 0 || lower.indexOf('salt') >= 0) {
-          findings[findCount] = {
-            id: 'insecure-crypto',
-            severity: 'high' as AuditSeverity,
-            title: 'Math.random() used for security',
-            file: file.path,
-            line: lineNum,
-            snippet: truncateSnippet(lineText, 120),
-            what: 'Math.random() is not cryptographically secure.',
-            risk: 'Tokens generated with Math.random() are predictable.',
-            fix: 'Use crypto.randomUUID() or crypto.randomBytes().',
-            fixCode: 'crypto.randomUUID()',
-          };
-          findCount++;
-        }
-      }
-      match = regex.exec(content);
     }
   }
 
@@ -436,98 +512,72 @@ export function checkInsecureCrypto(file: SourceFile): AuditFinding[] {
 
 // --- Tier 3: Medium ---
 
+function findFsOp(line: string): string {
+  // Return the fs operation name found, or empty if none
+  // Check longer names first to avoid partial matches
+  if (line.indexOf('readFileSync(') >= 0) return 'readFileSync';
+  if (line.indexOf('writeFileSync(') >= 0) return 'writeFileSync';
+  if (line.indexOf('readdirSync(') >= 0) return 'readdirSync';
+  if (line.indexOf('unlinkSync(') >= 0) return 'unlinkSync';
+  if (line.indexOf('readFile(') >= 0) return 'readFile';
+  if (line.indexOf('writeFile(') >= 0) return 'writeFile';
+  if (line.indexOf('readdir(') >= 0) return 'readdir';
+  if (line.indexOf('unlink(') >= 0) return 'unlink';
+  return '';
+}
+
 export function checkPathTraversal(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // fs operations with potential user input (template literal or concat)
-  const fsOps = ['readFile', 'readFileSync', 'writeFile', 'writeFileSync',
-    'readdir', 'readdirSync', 'unlink', 'unlinkSync', 'stat', 'statSync'];
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-  for (let fi = 0; fi < fsOps.length; fi++) {
-    const op = fsOps[fi];
-    // Template literal: fs.readFile(`...${...}`)
-    const tplPat = new RegExp(op + '\\s*\\(\\s*`[^`]*\\$\\{', 'g');
-    let match = tplPat.exec(content);
-    while (match !== null) {
-      const lineNum = getLineNumber(content, match.index);
-      const lineText = getLineAt(lines, lineNum);
+    if (isCommentLine(line)) continue;
 
-      if (!isCommentLine(lineText)) {
-        // Check for path validation nearby
-        let hasValidation = false;
-        const startLine = lineNum > 5 ? lineNum - 5 : 1;
-        for (let li = startLine; li <= lineNum; li++) {
-          const checkLine = getLineAt(lines, li);
-          if (checkLine.indexOf('path.resolve') >= 0 ||
-              checkLine.indexOf('path.normalize') >= 0 ||
-              checkLine.indexOf('startsWith') >= 0 ||
-              checkLine.indexOf('sanitize') >= 0 ||
-              checkLine.indexOf('..') >= 0) {
-            hasValidation = true;
-            break;
-          }
-        }
+    const op = findFsOp(line);
+    if (op.length === 0) continue;
 
-        if (!hasValidation) {
-          findings[findCount] = {
-            id: 'path-traversal',
-            severity: 'medium' as AuditSeverity,
-            title: 'Path traversal risk in ' + op,
-            file: file.path,
-            line: lineNum,
-            snippet: truncateSnippet(lineText, 120),
-            what: 'File system operation uses dynamic path without validation.',
-            risk: 'User input like "../../../etc/passwd" can access arbitrary files.',
-            fix: 'Validate and normalize the path. Ensure it stays within expected directory.',
-            fixCode: 'const safePath = path.resolve(baseDir, userInput); if (!safePath.startsWith(baseDir)) throw new Error(\'invalid path\');',
-          };
-          findCount++;
-        }
+    // Check for dynamic path (template literal or concat) after the fs op
+    const opIdx = line.indexOf(op);
+    const afterOp = line.substring(opIdx);
+
+    let isDynamic = false;
+    if (afterOp.indexOf('`') >= 0 && afterOp.indexOf('${') >= 0) isDynamic = true;
+    if (afterOp.indexOf('+') >= 0) isDynamic = true;
+
+    if (!isDynamic) continue;
+
+    // Check for path validation nearby
+    let hasValidation = false;
+    const startLine = lineNum > 5 ? lineNum - 5 : 1;
+    for (let li = startLine; li <= lineNum; li++) {
+      const checkLine = getLineAt(lines, li);
+      if (checkLine.indexOf('path.resolve') >= 0 ||
+          checkLine.indexOf('path.normalize') >= 0 ||
+          checkLine.indexOf('startsWith') >= 0 ||
+          checkLine.indexOf('sanitize') >= 0) {
+        hasValidation = true;
+        break;
       }
-      match = tplPat.exec(content);
     }
 
-    // Concatenation: fs.readFile(dir + userInput)
-    const concatPat = new RegExp(op + '\\s*\\([^)]*\\+', 'g');
-    let concatMatch = concatPat.exec(content);
-    while (concatMatch !== null) {
-      const lineNum = getLineNumber(content, concatMatch.index);
-      const lineText = getLineAt(lines, lineNum);
-
-      if (!isCommentLine(lineText)) {
-        let hasValidation = false;
-        const startLine = lineNum > 5 ? lineNum - 5 : 1;
-        for (let li = startLine; li <= lineNum; li++) {
-          const checkLine = getLineAt(lines, li);
-          if (checkLine.indexOf('path.resolve') >= 0 ||
-              checkLine.indexOf('path.normalize') >= 0 ||
-              checkLine.indexOf('startsWith') >= 0 ||
-              checkLine.indexOf('sanitize') >= 0) {
-            hasValidation = true;
-            break;
-          }
-        }
-
-        if (!hasValidation) {
-          findings[findCount] = {
-            id: 'path-traversal',
-            severity: 'medium' as AuditSeverity,
-            title: 'Path traversal risk in ' + op,
-            file: file.path,
-            line: lineNum,
-            snippet: truncateSnippet(lineText, 120),
-            what: 'File system operation uses concatenated path.',
-            risk: 'If user input is part of the path, directory traversal is possible.',
-            fix: 'Use path.resolve() and validate the result stays within the base directory.',
-            fixCode: 'const safePath = path.resolve(baseDir, userInput); if (!safePath.startsWith(baseDir)) throw new Error(\'invalid path\');',
-          };
-          findCount++;
-        }
-      }
-      concatMatch = concatPat.exec(content);
+    if (!hasValidation) {
+      findings[findCount] = {
+        id: 'path-traversal',
+        severity: 'medium' as AuditSeverity,
+        title: 'Path traversal risk in ' + op,
+        file: file.path,
+        line: lineNum,
+        snippet: truncateSnippet(line, 120),
+        what: 'File system operation uses dynamic path without validation.',
+        risk: 'User input like "../../../etc/passwd" can access arbitrary files.',
+        fix: 'Validate and normalize the path.',
+        fixCode: 'const safePath = path.resolve(baseDir, input); if (!safePath.startsWith(baseDir)) throw new Error(\'bad path\');',
+      };
+      findCount++;
     }
   }
 
@@ -537,57 +587,53 @@ export function checkPathTraversal(file: SourceFile): AuditFinding[] {
 export function checkInformationDisclosure(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // console.log of secrets
-  const consoleSecretPat = new RegExp('console\\.log\\s*\\([^)]*(?:password|secret|token|apiKey|api_key|private_key)[^)]*\\)', 'gi');
-  let csMatch = consoleSecretPat.exec(content);
-  while (csMatch !== null) {
-    const lineNum = getLineNumber(content, csMatch.index);
-    const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-    if (!isCommentLine(lineText)) {
-      findings[findCount] = {
-        id: 'info-disclosure',
-        severity: 'medium' as AuditSeverity,
-        title: 'Sensitive data logged',
-        file: file.path,
-        line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
-        what: 'Sensitive data (password/secret/token) is being logged.',
-        risk: 'Secrets in logs can be accessed by anyone with log access.',
-        fix: 'Remove console.log of sensitive values, or mask them.',
-        fixCode: 'console.log(\'auth: [REDACTED]\')',
-      };
-      findCount++;
+    if (isCommentLine(line)) continue;
+
+    // console.log of secrets
+    if (line.indexOf('console.log') >= 0) {
+      const lower = line.toLowerCase();
+      if (lower.indexOf('password') >= 0 || lower.indexOf('secret') >= 0 ||
+          lower.indexOf('token') >= 0 || lower.indexOf('apikey') >= 0 ||
+          lower.indexOf('api_key') >= 0 || lower.indexOf('private_key') >= 0) {
+        findings[findCount] = {
+          id: 'info-disclosure',
+          severity: 'medium' as AuditSeverity,
+          title: 'Sensitive data logged',
+          file: file.path,
+          line: lineNum,
+          snippet: truncateSnippet(line, 120),
+          what: 'Sensitive data (password/secret/token) is being logged.',
+          risk: 'Secrets in logs can be accessed by anyone with log access.',
+          fix: 'Remove console.log of sensitive values, or mask them.',
+          fixCode: 'console.log(\'auth: [REDACTED]\')',
+        };
+        findCount++;
+      }
     }
-    csMatch = consoleSecretPat.exec(content);
-  }
 
-  // Stack traces in error responses
-  const stackPat = new RegExp('(?:return|send|reply)\\s*[^;]*(?:err\\.stack|error\\.stack|e\\.stack)', 'g');
-  let stackMatch = stackPat.exec(content);
-  while (stackMatch !== null) {
-    const lineNum = getLineNumber(content, stackMatch.index);
-    const lineText = getLineAt(lines, lineNum);
-
-    if (!isCommentLine(lineText)) {
+    // Stack traces in error responses
+    if (line.indexOf('.stack') >= 0 &&
+        (line.indexOf('return') >= 0 || line.indexOf('send') >= 0 || line.indexOf('reply') >= 0)) {
       findings[findCount] = {
         id: 'info-disclosure',
         severity: 'medium' as AuditSeverity,
         title: 'Stack trace in response',
         file: file.path,
         line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
+        snippet: truncateSnippet(line, 120),
         what: 'Error stack trace may be sent to the client.',
         risk: 'Stack traces reveal internal paths and code structure to attackers.',
-        fix: 'Return a generic error message to clients. Log details server-side.',
+        fix: 'Return a generic error message to clients.',
         fixCode: 'return \'{"error":"Internal server error"}\'',
       };
       findCount++;
     }
-    stackMatch = stackPat.exec(content);
   }
 
   return findings;
@@ -596,32 +642,29 @@ export function checkInformationDisclosure(file: SourceFile): AuditFinding[] {
 export function checkInsecurePermissions(file: SourceFile): AuditFinding[] {
   const findings: AuditFinding[] = [];
   let findCount = 0;
-  const content = file.content;
   const lines = file.lines;
 
-  // chmod 777 or 0o777
-  const chmodPat = new RegExp('chmod(?:Sync)?\\s*\\([^)]*(?:0?o?777|0777|["\']777["\'])', 'g');
-  let match = chmodPat.exec(content);
-  while (match !== null) {
-    const lineNum = getLineNumber(content, match.index);
-    const lineText = getLineAt(lines, lineNum);
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    const lineNum = lineIdx + 1;
 
-    if (!isCommentLine(lineText)) {
+    if (isCommentLine(line)) continue;
+
+    if (line.indexOf('777') >= 0 && line.indexOf('chmod') >= 0) {
       findings[findCount] = {
         id: 'insecure-perms',
         severity: 'medium' as AuditSeverity,
         title: 'World-writable file permissions',
         file: file.path,
         line: lineNum,
-        snippet: truncateSnippet(lineText, 120),
-        what: 'File permissions set to 777 (world-readable, writable, executable).',
+        snippet: truncateSnippet(line, 120),
+        what: 'File permissions set to 777.',
         risk: 'Any user on the system can read, modify, or execute this file.',
-        fix: 'Use restrictive permissions like 0o755 (dirs) or 0o644 (files).',
+        fix: 'Use restrictive permissions like 0o755 or 0o644.',
         fixCode: 'fs.chmodSync(path, 0o644)',
       };
       findCount++;
     }
-    match = chmodPat.exec(content);
   }
 
   return findings;
@@ -684,15 +727,15 @@ export function runAllRules(files: SourceFile[], config: AuditConfig): AuditFind
       }
 
       if (!isIgnored('insecure-crypto', ignoredRules)) {
-        const crypto = checkInsecureCrypto(file);
-        for (let i = 0; i < crypto.length; i++) {
-          allFindings[totalCount] = crypto[i];
+        const cryptoFindings = checkInsecureCrypto(file);
+        for (let i = 0; i < cryptoFindings.length; i++) {
+          allFindings[totalCount] = cryptoFindings[i];
           totalCount++;
         }
       }
     }
 
-    // Tier 3 — Medium (always run unless filtered)
+    // Tier 3 — Medium (always run unless filtered to critical only)
     if (severityFilter === 'all' || severityFilter === 'high') {
       if (!isIgnored('path-traversal', ignoredRules)) {
         const paths = checkPathTraversal(file);
@@ -771,8 +814,4 @@ function filterBySeverityMinimum(findings: AuditFinding[], minSeverity: string):
     }
   }
   return result;
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

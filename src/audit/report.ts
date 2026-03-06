@@ -5,7 +5,7 @@ import { AuditResult, AuditFinding } from './types';
 function escapeHtml(s: string): string {
   let result = '';
   for (let i = 0; i < s.length; i++) {
-    const c = s[i];
+    const c = s.charAt(i);
     if (c === '<') result = result + '&lt;';
     else if (c === '>') result = result + '&gt;';
     else if (c === '&') result = result + '&amp;';

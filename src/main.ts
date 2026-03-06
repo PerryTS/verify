@@ -741,7 +741,7 @@ app.get('/audit/:auditId/html', async (request: any, reply: any) => {
 function escapeJsonStr(s: string): string {
   let result = '';
   for (let i = 0; i < s.length; i++) {
-    const c = s[i];
+    const c = s.charAt(i);
     if (c === '"') result = result + '\\"';
     else if (c === '\\') result = result + '\\\\';
     else if (c === '\n') result = result + '\\n';

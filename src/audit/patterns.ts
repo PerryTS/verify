@@ -93,7 +93,7 @@ export function shannonEntropy(s: string): number {
   let numChars = 0;
 
   for (let i = 0; i < s.length; i++) {
-    const c = s[i];
+    const c = s.charAt(i);
     let found = false;
     for (let j = 0; j < numChars; j++) {
       if (chars[j] === c) {
