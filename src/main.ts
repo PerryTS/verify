@@ -23,8 +23,51 @@ const TEMP_DIR = process.env.PERRY_VERIFY_TEMP_DIR || '/tmp/perry-verify';
 
 try { fs.mkdirSync(TEMP_DIR); } catch (e) { /* exists */ }
 
+// --- Security ---
+const AUTH_TOKEN = process.env.PERRY_VERIFY_AUTH_TOKEN || '';
+const RATE_LIMIT_WINDOW_MS = 60000;
+const RATE_LIMIT_MAX_VERIFY = parseInt(process.env.PERRY_VERIFY_RATE_LIMIT_VERIFY || '10', 10);
+const RATE_LIMIT_MAX_AUDIT = parseInt(process.env.PERRY_VERIFY_RATE_LIMIT_AUDIT || '20', 10);
+
 function getPublicUrl(): string {
   return process.env.PERRY_VERIFY_PUBLIC_URL || 'https://verify.perryts.com';
+}
+
+// --- Rate limiting ---
+
+const rlIps: string[] = [];
+const rlCounts: number[] = [];
+const rlResets: number[] = [];
+let rlSize = 0;
+
+function checkRateLimit(ip: string, maxReqs: number): boolean {
+  const now = Date.now();
+  for (let i = 0; i < rlSize; i++) {
+    if (rlIps[i] === ip) {
+      if (now - rlResets[i] > RATE_LIMIT_WINDOW_MS) {
+        rlCounts[i] = 1;
+        rlResets[i] = now;
+        return true;
+      }
+      rlCounts[i] = rlCounts[i] + 1;
+      return rlCounts[i] <= maxReqs;
+    }
+  }
+  rlIps[rlSize] = ip;
+  rlCounts[rlSize] = 1;
+  rlResets[rlSize] = now;
+  rlSize = rlSize + 1;
+  return true;
+}
+
+function getClientIp(request: any): string {
+  const xff = request.headers['x-forwarded-for'];
+  if (xff) {
+    const commaIdx = xff.indexOf(',');
+    const first = commaIdx >= 0 ? xff.substring(0, commaIdx) : xff;
+    return first.trim();
+  }
+  return 'unknown';
 }
 
 // --- Types ---
@@ -170,7 +213,7 @@ function dispatchJob(job: VerifyJob): boolean {
       config: job.config,
       manifest: job.manifest,
       target: job.target,
-      binary_url: getPublicUrl() + '/internal/binary/' + job.id,
+      binary_url: getPublicUrl() + '/internal/binary/' + AUTH_TOKEN + '/' + job.id,
     }));
   } catch (e) {
     worker.busy = false;
@@ -362,12 +405,17 @@ function handleWorkerMessage(msg: any, worker: WorkerInfo): void {
 
 // --- Fastify HTTP server ---
 
-const app = Fastify({ bodyLimit: 500 * 1024 * 1024 });
+const app = Fastify({ bodyLimit: 100 * 1024 * 1024 }); // 100MB max
 
 // POST /verify — submit a verification job
 app.post('/verify', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  console.log('[POST /verify] received request');
+  const clientIp = getClientIp(request);
+  if (!checkRateLimit(clientIp, RATE_LIMIT_MAX_VERIFY)) {
+    reply.status(429);
+    return '{"error":"Rate limit exceeded"}';
+  }
+  console.log('[POST /verify] received request from ' + clientIp);
 
   const hdrs = request.headers;
   const contentType = hdrs['content-type'] || '';
@@ -413,7 +461,7 @@ app.post('/verify', async (request: any, reply: any) => {
   }
 
   const target = targetPart.data.trim() as TargetPlatform;
-  const jobId = 'v_' + crypto.randomUUID().replace(/-/g, '').substring(0, 8);
+  const jobId = 'v_' + crypto.randomUUID().replace(/-/g, '');
   const dir = jobDir(jobId);
 
   try { fs.mkdirSync(dir); } catch (e) { /* exists */ }
@@ -521,8 +569,13 @@ app.get('/verify/:jobId/screenshots/:filename', async (request: any, reply: any)
   return JSON.stringify({ error: 'Screenshot not available' });
 });
 
-// GET /internal/binary/:jobId — workers download base64 binary
-app.get('/internal/binary/:jobId', async (request: any, reply: any) => {
+// GET /internal/binary/:token/:jobId — workers download base64 binary (auth required)
+app.get('/internal/binary/:token/:jobId', async (request: any, reply: any) => {
+  if (AUTH_TOKEN && request.params.token !== AUTH_TOKEN) {
+    reply.status(403);
+    reply.header('Content-Type', 'application/json');
+    return '{"error":"Unauthorized"}';
+  }
   const jobId = request.params.jobId;
   const job = getJob(jobId);
   if (!job) {
@@ -553,7 +606,12 @@ app.get('/health', async (_request: any, reply: any) => {
 // POST /audit — run security scan on source code
 app.post('/audit', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  console.log('[POST /audit] received request');
+  const clientIp = getClientIp(request);
+  if (!checkRateLimit(clientIp, RATE_LIMIT_MAX_AUDIT)) {
+    reply.status(429);
+    return '{"error":"Rate limit exceeded"}';
+  }
+  console.log('[POST /audit] received request from ' + clientIp);
 
   const hdrs = request.headers;
   const contentType = hdrs['content-type'] || '';
@@ -780,6 +838,11 @@ wss.on('message', (clientHandle: any, data: any) => {
     setClientIdentified(clientHandle);
 
     if (msg.type === 'worker_hello') {
+      if (AUTH_TOKEN && msg.token !== AUTH_TOKEN) {
+        console.log('Worker rejected: invalid auth token from ' + (msg.name || 'unknown'));
+        closeClient(clientHandle);
+        return;
+      }
       setClientRole(clientHandle, 'worker');
       const workerInfo: WorkerInfo = {
         clientHandle,
@@ -863,4 +926,6 @@ app.listen({ port: HTTP_PORT, host: '0.0.0.0' }, (err: any, address: string) => 
   console.log('perry-verify HTTP server listening at ' + address);
   console.log('platform: ' + hostPlatform());
   console.log('temp dir: ' + TEMP_DIR);
+  console.log('auth: ' + (AUTH_TOKEN ? 'configured' : 'NONE (set PERRY_VERIFY_AUTH_TOKEN)'));
+  console.log('rate limits: verify=' + String(RATE_LIMIT_MAX_VERIFY) + '/min, audit=' + String(RATE_LIMIT_MAX_AUDIT) + '/min');
 });
