@@ -710,14 +710,14 @@ app.post('/audit', async (request: any, reply: any) => {
 
   storeAuditResult(result);
 
-  // Build JSON response manually (avoid JSON.stringify crash on complex objects)
+  // Build JSON response — field names match CLI's expected struct
   let findingsJson = '[';
   for (let i = 0; i < result.findings.length; i++) {
     if (i > 0) findingsJson = findingsJson + ',';
     const f = result.findings[i];
-    findingsJson = findingsJson + '{"id":"' + f.id + '"';
+    findingsJson = findingsJson + '{"rule":"' + f.id + '"';
     findingsJson = findingsJson + ',"severity":"' + f.severity + '"';
-    findingsJson = findingsJson + ',"title":"' + escapeJsonStr(f.title) + '"';
+    findingsJson = findingsJson + ',"message":"' + escapeJsonStr(f.title) + '"';
     findingsJson = findingsJson + ',"file":"' + escapeJsonStr(f.file) + '"';
     findingsJson = findingsJson + ',"line":' + String(f.line);
     findingsJson = findingsJson + ',"snippet":"' + escapeJsonStr(f.snippet) + '"';
@@ -730,8 +730,9 @@ app.post('/audit', async (request: any, reply: any) => {
   findingsJson = findingsJson + ']';
 
   const s = result.summary;
-  let json = '{"auditId":"' + result.auditId + '"';
-  json = json + ',"summary":{"critical":' + String(s.critical) + ',"high":' + String(s.high) + ',"medium":' + String(s.medium) + ',"low":' + String(s.low) + ',"totalFiles":' + String(s.totalFiles) + ',"durationMs":' + String(s.durationMs) + ',"aiCostCents":' + String(s.aiCostCents) + '}';
+  const total = s.critical + s.high + s.medium + s.low;
+  let json = '{"id":"' + result.auditId + '"';
+  json = json + ',"summary":{"total":' + String(total) + ',"critical":' + String(s.critical) + ',"high":' + String(s.high) + ',"medium":' + String(s.medium) + ',"low":' + String(s.low) + ',"filesScanned":' + String(s.totalFiles) + ',"durationMs":' + String(s.durationMs) + ',"aiCostCents":' + String(s.aiCostCents) + '}';
   json = json + ',"grade":"' + result.grade + '"';
   json = json + ',"gradeExplanation":"' + escapeJsonStr(result.gradeExplanation) + '"';
   json = json + ',"findings":' + findingsJson;
@@ -755,9 +756,9 @@ app.get('/audit/:auditId', async (request: any, reply: any) => {
   for (let i = 0; i < result.findings.length; i++) {
     if (i > 0) findingsJson = findingsJson + ',';
     const f = result.findings[i];
-    findingsJson = findingsJson + '{"id":"' + f.id + '"';
+    findingsJson = findingsJson + '{"rule":"' + f.id + '"';
     findingsJson = findingsJson + ',"severity":"' + f.severity + '"';
-    findingsJson = findingsJson + ',"title":"' + escapeJsonStr(f.title) + '"';
+    findingsJson = findingsJson + ',"message":"' + escapeJsonStr(f.title) + '"';
     findingsJson = findingsJson + ',"file":"' + escapeJsonStr(f.file) + '"';
     findingsJson = findingsJson + ',"line":' + String(f.line);
     findingsJson = findingsJson + ',"snippet":"' + escapeJsonStr(f.snippet) + '"';
@@ -770,8 +771,9 @@ app.get('/audit/:auditId', async (request: any, reply: any) => {
   findingsJson = findingsJson + ']';
 
   const s = result.summary;
-  let json = '{"auditId":"' + result.auditId + '"';
-  json = json + ',"summary":{"critical":' + String(s.critical) + ',"high":' + String(s.high) + ',"medium":' + String(s.medium) + ',"low":' + String(s.low) + ',"totalFiles":' + String(s.totalFiles) + ',"durationMs":' + String(s.durationMs) + ',"aiCostCents":' + String(s.aiCostCents) + '}';
+  const total = s.critical + s.high + s.medium + s.low;
+  let json = '{"id":"' + result.auditId + '"';
+  json = json + ',"summary":{"total":' + String(total) + ',"critical":' + String(s.critical) + ',"high":' + String(s.high) + ',"medium":' + String(s.medium) + ',"low":' + String(s.low) + ',"filesScanned":' + String(s.totalFiles) + ',"durationMs":' + String(s.durationMs) + ',"aiCostCents":' + String(s.aiCostCents) + '}';
   json = json + ',"grade":"' + result.grade + '"';
   json = json + ',"gradeExplanation":"' + escapeJsonStr(result.gradeExplanation) + '"';
   json = json + ',"findings":' + findingsJson;
